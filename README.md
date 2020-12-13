@@ -1,2 +1,2 @@
-# Text_summerization_with_deep_learning
-Abstractive text summarization based on deep learning techniques
+# Abstractive text summerization with Transformers
+Abstractive text summarization using transformers (multi-head attention mechanism).
