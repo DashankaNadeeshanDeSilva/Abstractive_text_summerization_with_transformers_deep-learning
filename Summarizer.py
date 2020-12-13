@@ -230,3 +230,273 @@ class DecoderLayer(tf.keras.layers.Layer):
         out3 = self.layernorm3(ffn_output + out2)
 
         return out3, attn_weights_block1, attn_weights_block2
+
+
+# Encoder with multiple encoder layers
+class Encoder(tf.keras.layers.Layer):
+    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, maximum_position_encoding, rate=0.1):
+        super(Encoder, self).__init__()
+
+        self.d_model = d_model
+        self.num_layers = num_layers
+
+        self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model)
+        self.pos_encoding = positional_encoding(maximum_position_encoding, self.d_model)
+
+        self.enc_layers = [EncoderLayer(d_model, num_heads, dff, rate) for _ in range(num_layers)]
+
+        self.dropout = tf.keras.layers.Dropout(rate)
+
+    def call(self, x, training, mask):
+        seq_len = tf.shape(x)[1]
+
+        x = self.embedding(x)
+        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        x += self.pos_encoding[:, :seq_len, :]
+
+        x = self.dropout(x, training=training)
+
+        for i in range(self.num_layers):
+            x = self.enc_layers[i](x, training, mask)
+
+        return x
+
+# Encoder with multiple encoder layers
+class Decoder(tf.keras.layers.Layer):
+    def __init__(self, num_layers, d_model, num_heads, dff, target_vocab_size, maximum_position_encoding, rate=0.1):
+        super(Decoder, self).__init__()
+
+        self.d_model = d_model
+        self.num_layers = num_layers
+
+        self.embedding = tf.keras.layers.Embedding(target_vocab_size, d_model)
+        self.pos_encoding = positional_encoding(maximum_position_encoding, d_model)
+
+        self.dec_layers = [DecoderLayer(d_model, num_heads, dff, rate) for _ in range(num_layers)]
+        self.dropout = tf.keras.layers.Dropout(rate)
+
+    def call(self, x, enc_output, training, look_ahead_mask, padding_mask):
+        seq_len = tf.shape(x)[1]
+        attention_weights = {}
+
+        x = self.embedding(x)
+        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        x += self.pos_encoding[:, :seq_len, :]
+
+        x = self.dropout(x, training=training)
+
+        for i in range(self.num_layers):
+            x, block1, block2 = self.dec_layers[i](x, enc_output, training, look_ahead_mask, padding_mask)
+
+            attention_weights['decoder_layer{}_block1'.format(i + 1)] = block1
+            attention_weights['decoder_layer{}_block2'.format(i + 1)] = block2
+
+        return x, attention_weights
+
+
+# Transformer
+class Transformer(tf.keras.Model):
+    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, target_vocab_size, pe_input, pe_target,
+                 rate=0.1):
+        super(Transformer, self).__init__()
+
+        self.encoder = Encoder(num_layers, d_model, num_heads, dff, input_vocab_size, pe_input, rate)
+
+        self.decoder = Decoder(num_layers, d_model, num_heads, dff, target_vocab_size, pe_target, rate)
+
+        self.final_layer = tf.keras.layers.Dense(target_vocab_size)
+
+    def call(self, inp, tar, training, enc_padding_mask, look_ahead_mask, dec_padding_mask):
+        enc_output = self.encoder(inp, training, enc_padding_mask)
+
+        dec_output, attention_weights = self.decoder(tar, enc_output, training, look_ahead_mask, dec_padding_mask)
+
+        final_output = self.final_layer(dec_output)
+
+        return final_output, attention_weights
+
+
+# Training phase
+
+# hyper-parameters
+num_layers = 4
+d_model = 128
+dff = 512
+num_heads = 8
+EPOCHS = 20
+
+
+# Learning rate custom scheduling class
+class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, d_model, warmup_steps=4000):
+        super(CustomSchedule, self).__init__()
+
+        self.d_model = d_model
+        self.d_model = tf.cast(self.d_model, tf.float32)
+
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        arg1 = tf.math.rsqrt(step)
+        arg2 = step * (self.warmup_steps ** -1.5)
+
+        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+
+
+# setting up learning rate, optimizer and loss
+learning_rate = CustomSchedule(d_model)
+optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98, epsilon=1e-9)
+loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+
+
+def loss_function(real, pred):
+    mask = tf.math.logical_not(tf.math.equal(real, 0))
+    loss_ = loss_object(real, pred)
+
+    mask = tf.cast(mask, dtype=loss_.dtype)
+    loss_ *= mask
+
+    return tf.reduce_sum(loss_)/tf.reduce_sum(mask)
+
+
+train_loss = tf.keras.metrics.Mean(name='train_loss')
+
+# Transformer object
+transformer = Transformer(
+    num_layers,
+    d_model,
+    num_heads,
+    dff,
+    encoder_vocab_size,
+    decoder_vocab_size,
+    pe_input=encoder_vocab_size,
+    pe_target=decoder_vocab_size,
+)
+
+
+# Mask objects creation
+def create_masks(inp, tar):
+    enc_padding_mask = create_padding_mask(inp)
+    dec_padding_mask = create_padding_mask(inp)
+
+    look_ahead_mask = create_look_ahead_mask(tf.shape(tar)[1])
+    dec_target_padding_mask = create_padding_mask(tar)
+    combined_mask = tf.maximum(dec_target_padding_mask, look_ahead_mask)
+
+    return enc_padding_mask, combined_mask, dec_padding_mask
+
+
+# Chcek points setup
+checkpoint_path = "checkpoints"
+
+ckpt = tf.train.Checkpoint(transformer=transformer, optimizer=optimizer)
+
+ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
+
+if ckpt_manager.latest_checkpoint:
+    ckpt.restore(ckpt_manager.latest_checkpoint)
+    print ('Latest checkpoint restored!!')
+
+
+# Training steps func and training loop
+@tf.function
+def train_step(inp, tar):
+    tar_inp = tar[:, :-1]
+    tar_real = tar[:, 1:]
+
+    enc_padding_mask, combined_mask, dec_padding_mask = create_masks(inp, tar_inp)
+
+    with tf.GradientTape() as tape:
+        predictions, _ = transformer(
+            inp, tar_inp,
+            True,
+            enc_padding_mask,
+            combined_mask,
+            dec_padding_mask
+        )
+        loss = loss_function(tar_real, predictions)
+
+    gradients = tape.gradient(loss, transformer.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
+
+    train_loss(loss)
+
+
+for epoch in range(EPOCHS):
+    start = time.time()
+
+    train_loss.reset_states()
+
+    for (batch, (inp, tar)) in enumerate(dataset):
+        train_step(inp, tar)
+
+        # 55k samples
+        # we display 3 batch results -- 0th, middle and last one (approx)
+        # 55k / 64 ~ 858; 858 / 2 = 429
+        if batch % 429 == 0:
+            print('Epoch {} Batch {} Loss {:.4f}'.format(epoch + 1, batch, train_loss.result()))
+
+    if (epoch + 1) % 5 == 0:
+        ckpt_save_path = ckpt_manager.save()
+        print('Saving checkpoint for epoch {} at {}'.format(epoch + 1, ckpt_save_path))
+
+    print('Epoch {} Loss {:.4f}'.format(epoch + 1, train_loss.result()))
+
+    print('Time taken for 1 epoch: {} secs\n'.format(time.time() - start))
+
+
+# Inference
+# Evaluation func
+# 1. Predicting one word at a time at the decoder and appending it to the output
+# 2. Take the complete sequence as an input to the decoder and repeating until maxlen or stop keyword appears
+def evaluate(input_document):
+    input_document = document_tokenizer.texts_to_sequences([input_document])
+    input_document = tf.keras.preprocessing.sequence.pad_sequences(input_document, maxlen=encoder_maxlen,
+                                                                   padding='post', truncating='post')
+
+    encoder_input = tf.expand_dims(input_document[0], 0)
+
+    decoder_input = [summary_tokenizer.word_index["<go>"]]
+    output = tf.expand_dims(decoder_input, 0)
+
+    for i in range(decoder_maxlen):
+        enc_padding_mask, combined_mask, dec_padding_mask = create_masks(encoder_input, output)
+
+        predictions, attention_weights = transformer(
+            encoder_input,
+            output,
+            False,
+            enc_padding_mask,
+            combined_mask,
+            dec_padding_mask
+        )
+
+        predictions = predictions[:, -1:, :]
+        predicted_id = tf.cast(tf.argmax(predictions, axis=-1), tf.int32)
+
+        if predicted_id == summary_tokenizer.word_index["<stop>"]:
+            return tf.squeeze(output, axis=0), attention_weights
+
+        output = tf.concat([output, predicted_id], axis=-1)
+
+    return tf.squeeze(output, axis=0), attention_weights
+
+
+# Summary or inference func
+def summarize(input_document):
+    # not considering attention weights for now, can be used to plot attention heatmaps in the future
+    summarized = evaluate(input_document=input_document)[0].numpy()
+    summarized = np.expand_dims(summarized[1:], 0)  # not printing <go> token
+    return summary_tokenizer.sequences_to_texts(summarized)[0]  # since there is just one translated document
+
+# Test on an example text
+ex_text = "US-based private equity firm General Atlantic is in talks to invest about \
+    $850 million to $950 million in Reliance Industries' digital unit Jio \
+    Platforms, the Bloomberg reported. Saudi Arabia's $320 billion sovereign \
+    wealth fund is reportedly also exploring a potential investment in the \
+    Mukesh Ambani-led company. The 'Public Investment Fund' is looking to \
+    acquire a minority stake in Jio Platforms."
+
+summary_out = summarize(ex_text)
+print(summary_out)
+
