@@ -12,9 +12,9 @@ utilities: pickle, re
 
 **Components of the pipeline**
 
-1. Utilities: Positional encoding and masking
-2. Model: Mulit head attention with encoder-decoder blocks
-3. Training loop and inference
+1. Utilities: Positional encoding and masking.
+2. Model: Mulit head attention with encoder-decoder blocks.
+3. Training loop and inference for testing.
 
 **How to run**
 
